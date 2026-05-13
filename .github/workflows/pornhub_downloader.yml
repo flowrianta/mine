@@ -7,18 +7,21 @@ on:
         description: 'URL of the video'
         required: true
         type: string
+
       output_folder:
-        description: 'Folder where the video will be saved (inside /tmp)'
+        description: 'Folder inside /tmp where the video will be saved'
         required: false
         type: string
         default: 'Videos'
+
       quality:
-        description: 'Video quality (yt-dlp format selector)'
+        description: 'Video quality format (yt-dlp selector)'
         required: true
         type: string
         default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
+
       archive_name:
-        description: 'RAR archive base name'
+        description: 'Base name of RAR archive'
         required: false
         type: string
         default: 'video'
@@ -47,7 +50,6 @@ jobs:
         id: download
         shell: bash
         run: |
-          # Real folder location (NOT inside repository)
           FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
           mkdir -p "$FOLDER"
 
@@ -58,8 +60,10 @@ jobs:
           for i in $(seq 1 $MAX_RETRIES); do
             echo "--- Attempt $i/$MAX_RETRIES ---"
 
+            # Save list of existing files
             find "$FOLDER" -type f > /tmp/before_files.txt
 
+            # Download
             yt-dlp \
               --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
               --format "${{ github.event.inputs.quality }}" \
@@ -88,7 +92,7 @@ jobs:
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "::error::All attempts failed"
+            echo "::error::All $MAX_RETRIES attempts failed"
             exit 1
           fi
 
@@ -115,8 +119,8 @@ jobs:
             rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
             rm "$FILENAME"
 
-            echo "archive_name=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
             echo "split_done=true" >> "$GITHUB_OUTPUT"
+            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
           else
             echo "split_done=false" >> "$GITHUB_OUTPUT"
           fi
