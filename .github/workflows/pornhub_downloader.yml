@@ -35,19 +35,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install yt-dlp and dependencies
+      - name: Install dependencies
         run: |
           pip install -U yt-dlp
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y bc rar
 
       - name: Download video (retry up to 5 times)
@@ -58,15 +51,14 @@ jobs:
           mkdir -p "$FOLDER"
 
           MAX_RETRIES=5
-          RETRY_COUNT=0
           SUCCESS=false
           NEW_FILE=""
 
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "::group::Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "--- Attempt $i/$MAX_RETRIES ---"
 
-            # استفاده از --print برای گرفتن مسیر دقیق فایل خروجی
-            OUTPUT=$(yt-dlp \
+            # ابتدا فایل‌های موجود رو ثبت کن
+            find "$FOLDER" -type f > /tmp/before_files.txtyt-dlp \
               --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
               --format "${{ github.event.inputs.quality }}" \
               --merge-output-format mp4 \
@@ -76,39 +68,26 @@ jobs:
               --geo-bypass \
               --no-color \
               --newline \
-              --print after_move:filepath \
-              "${{ github.event.inputs.url }}" 2>&1 | tee /dev/stderr | grep -v '^\[' | tail -1)
+              "${{ github.event.inputs.url }}"
 
-            EXIT_CODE=${PIPESTATUS[0]}
+            EXIT_CODE=$?
 
-            echo "::endgroup::"
-
-            if [ $EXIT_CODE -eq 0 ] && [ -n "$OUTPUT" ] && [ -f "$OUTPUT" ]; then
-              NEW_FILE="$OUTPUT"
-              echo "Download succeeded: $NEW_FILE"
-              SUCCESS=true
-              break
-            fi
-
-            # Fallback: شاید --print کار نکرده، فایل جدید رو با find پیدا کن
             if [ $EXIT_CODE -eq 0 ]; then
-              FOUND=$(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) -mmin -2 -print -quit)
-              if [ -n "$FOUND" ] && [ -f "$FOUND" ]; then
-                NEW_FILE="$FOUND"
-                echo "Download succeeded (fallback detection): $NEW_FILE"
+              # فایل جدید = فایلی که قبلاً نبوده
+              NEW_FILE=$(comm -13 \
+                <(sort /tmp/before_files.txt) \
+                <(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | sort) \
+                | head -1)
+
+              if [ -n "$NEW_FILE" ] && [ -f "$NEW_FILE" ]; then
+                echo "Download succeeded: $NEW_FILE"
                 SUCCESS=true
                 break
               fi
             fi
 
-            echo "Attempt $((RETRY_COUNT+1)) failed (exit=$EXIT_CODE)"
-            RETRY_COUNT=$((RETRY_COUNT+1))
-
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              WAIT=$((10 * RETRY_COUNT))
-              echo "Waiting ${WAIT}s before retry..."
-              sleep $WAIT
-            fi
+            echo "Attempt $i failed (exit=$EXIT_CODE)"
+            [ $i -lt $MAX_RETRIES ] && sleep $((10 * i))
           done
 
           if [ "$SUCCESS" = false ]; then
@@ -123,7 +102,7 @@ jobs:
           echo "filepath=$NEW_FILE" >> "$GITHUB_OUTPUT"
           echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"
 
-      - name: Conditional split (if file > 99 MB)
+      - name: Split if file > 99 MB
         id: split
         shell: bash
         run: |
@@ -131,11 +110,10 @@ jobs:
           FILENAME="${{ steps.download.outputs.filename }}"
           SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
           SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
 
           cd "$FOLDER"
 
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+          if (( $(echo "$SIZE_MB > 99" | bc -l) )); then
             RANDOM_HEX=$(openssl rand -hex 3)
             ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
 
@@ -143,33 +121,24 @@ jobs:
             rm "$FILENAME"
 
             echo "split_done=true" >> "$GITHUB_OUTPUT"
-            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
-            ls -lh "${ARCHIVE_NAME}"*.rar
-          else
+            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"else
             echo "split_done=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit and push to repository
+      - name: Upload to GitHub Release
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          TAG="dl-$(date +%Y%m%d-%H%M%S)"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          gh release create "$TAG" \
+            --title "📥 ${FILENAME}" \
+            --notes "Source: ${{ github.event.inputs.url }}" \
+            --latest
 
-          git add "$FOLDER/"
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit"
-            exit 0
-          fi
-
-          git commit -m "Add downloaded video(s)"
-
-          # جلوگیری از race condition با pull --rebase قبل از push
-          MAX_PUSH_RETRIES=3
-          for i in $(seq 1 $MAX_PUSH_RETRIES); do
-            git pull --rebase origin main && git push && break
-            echo "Push attempt $i failed, retrying..."
-            sleep 3
+          find "$FOLDER" -type f | while read -r f; do
+            gh release upload "$TAG" "$f" --clobber
           done
