@@ -7,21 +7,18 @@ on:
         description: 'URL of the video'
         required: true
         type: string
-
       output_folder:
-        description: 'Folder inside /tmp where the video will be saved'
+        description: 'Folder where the video will be saved'
         required: false
         type: string
-        default: 'Videos'
-
+        default: 'downloads'
       quality:
-        description: 'Video quality format (yt-dlp selector)'
+        description: 'Video quality (yt-dlp format selector)'
         required: true
         type: string
         default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
-
       archive_name:
-        description: 'Base name of RAR archive'
+        description: 'Base name for the RAR archive (if file is split)'
         required: false
         type: string
         default: 'video'
@@ -38,107 +35,119 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Install dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install yt-dlp and bc
         run: |
           pip install -U yt-dlp
-          sudo apt-get update -qq
-          sudo apt-get install -y bc rar
+          sudo apt-get update
+          sudo apt-get install -y bc
 
       - name: Download video (retry up to 5 times)
         id: download
         shell: bash
         run: |
-          FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
+          FOLDER="${{ github.event.inputs.output_folder }}"
           mkdir -p "$FOLDER"
+          touch marker
 
           MAX_RETRIES=5
+          RETRY_COUNT=0
           SUCCESS=false
-          NEW_FILE=""
 
-          for i in $(seq 1 $MAX_RETRIES); do
-            echo "--- Attempt $i/$MAX_RETRIES ---"
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
 
-            # Save list of existing files
-            find "$FOLDER" -type f > /tmp/before_files.txt
-
-            # Download
             yt-dlp \
-              --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
               --format "${{ github.event.inputs.quality }}" \
               --merge-output-format mp4 \
-              --retries 10 \
+              --retries 3 \
               --fragment-retries 10 \
-              "${{ github.event.inputs.url }}"
+              --no-check-certificate \
+              --geo-bypass \
+              --no-color \
+              --ignore-errors \
+              --newline \
+              "${{ github.event.inputs.url }}" && {
 
-            EXIT_CODE=$?
+                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
 
-            if [ $EXIT_CODE -eq 0 ]; then
-              NEW_FILE=$(comm -13 \
-                <(sort /tmp/before_files.txt) \
-                <(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | sort) \
-              | head -1)
+                if [ -n "$NEW_FILE" ]; then
+                  echo "Download succeeded: $NEW_FILE"
+                  SUCCESS=true
+                  break
+                else
+                  echo "Download finished but no file detected. Retrying..."
+                fi
+              } || {
+                echo "Download attempt failed"
+              }
 
-              if [ -n "$NEW_FILE" ] && [ -f "$NEW_FILE" ]; then
-                echo "Download succeeded: $NEW_FILE"
-                SUCCESS=true
-                break
-              fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              sleep 5
             fi
-
-            echo "Attempt $i failed (exit=$EXIT_CODE)"
-            [ $i -lt $MAX_RETRIES ] && sleep $((10 * i))
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "::error::All $MAX_RETRIES attempts failed"
+            echo "All download attempts failed"
             exit 1
           fi
 
-          echo "filename=$(basename "$NEW_FILE")" >> "$GITHUB_OUTPUT"
-          echo "filepath=$NEW_FILE" >> "$GITHUB_OUTPUT"
-          echo "size_bytes=$(stat -c %s "$NEW_FILE")" >> "$GITHUB_OUTPUT"
+          FILENAME=$(basename "$NEW_FILE")
+          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
 
-      - name: Split if file > 99 MB
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
+
+      - name: Install RAR
+        run: sudo apt-get install -y rar
+
+      - name: Conditional split (if file > 99 MB)
         id: split
         shell: bash
         run: |
-          FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
-          FILEPATH="${{ steps.download.outputs.filepath }}"
-          FILENAME=$(basename "$FILEPATH")
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
           SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "$SIZE_BYTES / 1048576" | bc)
+          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
+          THRESHOLD_MB=99
 
           cd "$FOLDER"
 
-          if (( SIZE_MB > 99 )); then
+          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+
             RANDOM_HEX=$(openssl rand -hex 3)
             ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
 
             rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+
             rm "$FILENAME"
 
-            echo "split_done=true" >> "$GITHUB_OUTPUT"
-            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+            echo "split_done=true" >> $GITHUB_OUTPUT
+            ls -lh "${ARCHIVE_NAME}.part"*.rar
+
           else
-            echo "split_done=false" >> "$GITHUB_OUTPUT"
+            echo "split_done=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Upload to GitHub Release
+      - name: Commit and push to repository
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
-          TAG="dl-$(date +%Y%m%d-%H%M%S)"
-          TITLE="${{ steps.download.outputs.filename }}"
+          FOLDER="${{ github.event.inputs.output_folder }}"
 
-          gh release create "$TAG" \
-            --title "📥 $TITLE" \
-            --notes "Source: ${{ github.event.inputs.url }}" \
-            --latest
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          find "$FOLDER" -type f | while read -r f; do
-            gh release upload "$TAG" "$f" --clobber
-          done
+          git add "$FOLDER/"
+
+          git commit -m "Add downloaded video(s)" || echo "Nothing to commit"
+
+          git push
