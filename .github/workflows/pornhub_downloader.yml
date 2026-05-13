@@ -1,44 +1,54 @@
-name: Download Video
+name: p
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'Video URL'
+        description: 'URL of the video'
         required: true
-      quality:
-        description: 'Quality (e.g. bestvideo+bestaudio/best)'
-        required: false
-        default: 'bestvideo+bestaudio/best'
+        type: string
       output_folder:
-        description: 'Output folder name'
+        description: 'Folder where the video will be saved (inside /tmp)'
         required: false
-        default: 'downloads'archive_name:
-        description: 'Archive name (without extension)'
+        type: string
+        default: 'Videos'
+      quality:
+        description: 'Video quality (yt-dlp format selector)'
+        required: true
+        type: string
+        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
+      archive_name:
+        description: 'RAR archive base name'
         required: false
+        type: string
         default: 'video'
 
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  download:
+  download-and-maybe-split:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install yt-dlp
-        run: pip install -U yt-dlp
-
-      - name: Install rar
-        run: sudo apt-get install -y rar
+      - name: Install dependencies
+        run: |
+          pip install -U yt-dlp
+          sudo apt-get update -qq
+          sudo apt-get install -y bc rar
 
       - name: Download video (retry up to 5 times)
         id: download
         shell: bash
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
+          # Real folder location (NOT inside repository)
+          FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
           mkdir -p "$FOLDER"
 
           MAX_RETRIES=5
@@ -51,15 +61,11 @@ jobs:
             find "$FOLDER" -type f > /tmp/before_files.txt
 
             yt-dlp \
-              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+              --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
               --format "${{ github.event.inputs.quality }}" \
               --merge-output-format mp4 \
               --retries 10 \
               --fragment-retries 10 \
-              --no-check-certificate \
-              --geo-bypass \
-              --no-color \
-              --newline \
               "${{ github.event.inputs.url }}"
 
             EXIT_CODE=$?
@@ -68,7 +74,7 @@ jobs:
               NEW_FILE=$(comm -13 \
                 <(sort /tmp/before_files.txt) \
                 <(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | sort) \
-                | head -1)
+              | head -1)
 
               if [ -n "$NEW_FILE" ] && [ -f "$NEW_FILE" ]; then
                 echo "Download succeeded: $NEW_FILE"
@@ -82,57 +88,53 @@ jobs:
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "::error::All $MAX_RETRIES download attempts failed"
+            echo "::error::All attempts failed"
             exit 1
           fi
 
-          FILENAME=$(basename "$NEW_FILE")
-          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
-
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filename=$(basename "$NEW_FILE")" >> "$GITHUB_OUTPUT"
           echo "filepath=$NEW_FILE" >> "$GITHUB_OUTPUT"
-          echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"- name: Split if file > 99 MB
+          echo "size_bytes=$(stat -c %s "$NEW_FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Split if file > 99 MB
         id: split
         shell: bash
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
+          FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          FILENAME=$(basename "$FILEPATH")
           SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
+          SIZE_MB=$(echo "$SIZE_BYTES / 1048576" | bc)
 
           cd "$FOLDER"
 
-          if (( $(echo "$SIZE_MB > 99" | bc -l) )); then
+          if (( SIZE_MB > 99 )); then
             RANDOM_HEX=$(openssl rand -hex 3)
             ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
 
             rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
             rm "$FILENAME"
 
+            echo "archive_name=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
             echo "split_done=true" >> "$GITHUB_OUTPUT"
-            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
           else
             echo "split_done=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload to GitHub Releases
+      - name: Upload to GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          SPLIT_DONE="${{ steps.split.outputs.split_done }}"
-          TAG="video-$(date +'%Y%m%d-%H%M%S')"
+          FOLDER="/tmp/${{ github.event.inputs.output_folder }}"
+          TAG="dl-$(date +%Y%m%d-%H%M%S)"
+          TITLE="${{ steps.download.outputs.filename }}"
 
           gh release create "$TAG" \
-            --title "Video Download - $(date +'%Y-%m-%d %H:%M:%S')" \
-            --notes "Downloaded from: ${{ github.event.inputs.url }}"
+            --title "📥 $TITLE" \
+            --notes "Source: ${{ github.event.inputs.url }}" \
+            --latest
 
-          if [ "$SPLIT_DONE" = "true" ]; then
-            ARCHIVE_NAME="${{ steps.split.outputs.archive_name }}"
-            for f in "$FOLDER/${ARCHIVE_NAME}"*.rar; do
-              gh release upload "$TAG" "$f"
-            done
-          elseFILEPATH="${{ steps.download.outputs.filepath }}"
-            gh release upload "$TAG" "$FILEPATH"
-          fi
+          find "$FOLDER" -type f | while read -r f; do
+            gh release upload "$TAG" "$f" --clobber
+          done
