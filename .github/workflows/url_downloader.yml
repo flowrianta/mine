@@ -1,0 +1,247 @@
+name: "دانلودر لینک مستقیم"
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Direct File URL"
+        required: true
+        type: string
+
+      zip_password:
+        description: "Password for archive (leave empty for no password)"
+        required: false
+        default: ""
+        type: string
+
+      max_part_mb:
+        description: "Maximum size per part (MB)"
+        required: false
+        default: "90"
+        type: string
+
+      upload_method:
+        description: "Upload Method"
+        required: true
+        default: "repository"
+        type: choice
+        options:
+          - repository
+          - release
+
+      release_tag:
+        description: "Release Tag"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl
+
+      - name: Download File
+        id: download
+        shell: bash
+        run: |
+          mkdir -p temp_dl
+
+          FILE_URL="${{ github.event.inputs.file_url }}"
+
+          # استخراج نام فایل از URL
+          FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+
+          # اگه نام فایل خالی یا فقط _ بود، یه اسم پیش‌فرض بذار
+          if [[ -z "$FILENAME" || "$FILENAME" =~ ^_+$ ]]; then
+            FILENAME="downloaded_file"
+          fi
+
+          echo "Downloading: $FILENAME"
+          echo "URL: $FILE_URL"
+
+          MAX_RETRIES=3
+          SUCCESS=false
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "--- Attempt $i/$MAX_RETRIES ---"
+
+            HTTP_CODE=$(curl -L -w "%{http_code}" \
+              --fail \
+              --retry 3 \
+              --retry-delay 5 \
+              --connect-timeout 30 \
+              --max-time 1800 \
+              -o "temp_dl/$FILENAME" \
+              "$FILE_URL")
+
+            CURL_EXIT=$?
+
+            if [ $CURL_EXIT -eq 0 ] && [ -f "temp_dl/$FILENAME" ]; then
+              FILE_SIZE=$(stat -c %s "temp_dl/$FILENAME" 2>/dev/null || echo "0")
+              if [ "$FILE_SIZE" -gt 0 ]; then
+                echo "Download successful (HTTP $HTTP_CODE, size: $FILE_SIZE bytes)"
+                SUCCESS=true
+                break
+              else
+                echo "File is empty, retrying..."
+                rm -f "temp_dl/$FILENAME"
+              fi
+            else
+              echo "curl failed (exit=$CURL_EXIT, HTTP=$HTTP_CODE)"
+              rm -f "temp_dl/$FILENAME"
+            fi
+
+            if [ $i -lt $MAX_RETRIES ]; then
+              WAIT=$((10 * i))
+              echo "Waiting ${WAIT}s..."
+              sleep $WAIT
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "::error::Download failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+          echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create Split Archive
+        id: archive
+        shell: bash
+        run: |
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          FILENAME="${{ steps.download.outputs.filename }}"
+          PASS="${{ github.event.inputs.zip_password }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          # اعتبارسنجی threshold
+          if ! [[ "$THRESH_MB" =~ ^[0-9]+$ ]] || [ "$THRESH_MB" -le 0 ] || [ "$THRESH_MB" -gt 1900 ]; then
+            THRESH_MB=90
+          fi
+
+          cd temp_dl || exit 1
+
+          ARCHIVE_BASE="${FILENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+
+          echo "Creating archive: ${ARCHIVE_BASE}.7z (max ${THRESH_MB}MB per part)"
+
+          if [ -n "$PASS" ]; then
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$FILENAME"
+          else
+            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$FILENAME"
+          fi
+
+          SEVEN_EXIT=$?
+          if [ $SEVEN_EXIT -ne 0 ]; then
+            echo "::error::7z failed with exit code $SEVEN_EXIT"
+            exit 1
+          fi
+
+          # اگه فقط یک پارت ساخته شده، پسوند .001 رو حذف کن
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+
+          # حذف فایل اصلی — فقط آرشیو نگه داشته بشه
+          rm -f "$FILENAME"
+
+          echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
+
+          echo "--- Archive contents ---"
+          ls -lh "${ARCHIVE_BASE}".7z*
+
+          cd ..
+
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          mkdir -p downloads
+
+          # فقط فایل‌های آرشیو رو منتقل کن
+          mv temp_dl/*.7z* downloads/ 2>/dev/null || true
+
+          # بررسی حجم هر فایل — GitHub حداکثر 100MB قبول می‌کنه
+          OVERSIZED=false
+          for f in downloads/*; do
+            [ -f "$f" ] || continue
+            SIZE=$(stat -c %s "$f")
+            if [ "$SIZE" -gt 104857600 ]; then
+              echo "::error::File $(basename "$f") is $(( SIZE / 1048576 ))MB — exceeds GitHub's 100MB limit"
+              OVERSIZED=true
+            fi
+          done
+
+          if [ "$OVERSIZED" = true ]; then
+            echo "::error::One or more files exceed 100MB. Use 'release' upload method or reduce max_part_mb."
+            exit 1
+          fi
+
+          git add downloads/
+
+          # اگه چیزی برای commit نیست، خارج شو
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]"
+
+          # Push با retry و pull --rebase برای جلوگیری از race condition
+          MAX_PUSH=3
+          for i in $(seq 1 $MAX_PUSH); do
+            git pull --rebase origin "$(git branch --show-current)" 2>/dev/null || true
+            if git push; then
+              echo "Push successful on attempt $i"
+              break
+            fi
+            if [ $i -eq $MAX_PUSH ]; then
+              echo "::error::Push failed after $MAX_PUSH attempts"
+              exit 1
+            fi
+            echo "Push attempt $i failed, retrying in 5s..."
+            sleep 5
+          done
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('direct-{0}', github.run_number) }}
+          name: "Direct Download: ${{ steps.download.outputs.filename }}"
+          body: |
+            **File:** ${{ steps.download.outputs.filename }}
+            **Date:** ${{ steps.get_date.outputs.date }}
+            **Archive:** ${{ steps.archive.outputs.archive_name }}
+          files: temp_dl/*.7z*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf temp_dl
