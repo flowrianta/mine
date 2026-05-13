@@ -1,47 +1,38 @@
-name: p
+name: Download Video
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL of the video'
+        description: 'Video URL'
         required: true
-        type: string
-      output_folder:
-        description: 'Folder where the video will be saved'
-        required: false
-        type: string
-        default: 'downloads'
       quality:
-        description: 'Video quality (yt-dlp format selector)'
-        required: true
-        type: string
-        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
-      archive_name:
-        description: 'Base name for the RAR archive (if file is split)'
+        description: 'Quality (e.g. bestvideo+bestaudio/best)'
         required: false
-        type: string
+        default: 'bestvideo+bestaudio/best'
+      output_folder:
+        description: 'Output folder name'
+        required: false
+        default: 'downloads'archive_name:
+        description: 'Archive name (without extension)'
+        required: false
         default: 'video'
 
-permissions:
-  contents: write
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  download-and-maybe-split:
+  download:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          pip install -U yt-dlp
-          sudo apt-get update -qq
-          sudo apt-get install -y bc rar
+      - name: Install yt-dlp
+        run: pip install -U yt-dlp
+
+      - name: Install rar
+        run: sudo apt-get install -y rar
 
       - name: Download video (retry up to 5 times)
         id: download
@@ -57,8 +48,9 @@ jobs:
           for i in $(seq 1 $MAX_RETRIES); do
             echo "--- Attempt $i/$MAX_RETRIES ---"
 
-            # ابتدا فایل‌های موجود رو ثبت کن
-            find "$FOLDER" -type f > /tmp/before_files.txtyt-dlp \
+            find "$FOLDER" -type f > /tmp/before_files.txt
+
+            yt-dlp \
               --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
               --format "${{ github.event.inputs.quality }}" \
               --merge-output-format mp4 \
@@ -73,7 +65,6 @@ jobs:
             EXIT_CODE=$?
 
             if [ $EXIT_CODE -eq 0 ]; then
-              # فایل جدید = فایلی که قبلاً نبوده
               NEW_FILE=$(comm -13 \
                 <(sort /tmp/before_files.txt) \
                 <(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) | sort) \
@@ -100,9 +91,7 @@ jobs:
 
           echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
           echo "filepath=$NEW_FILE" >> "$GITHUB_OUTPUT"
-          echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"
-
-      - name: Split if file > 99 MB
+          echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"- name: Split if file > 99 MB
         id: split
         shell: bash
         run: |
@@ -121,24 +110,29 @@ jobs:
             rm "$FILENAME"
 
             echo "split_done=true" >> "$GITHUB_OUTPUT"
-            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"else
+            echo "archive_name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+          else
             echo "split_done=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload to GitHub Release
+      - name: Upload to GitHub Releases
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          TAG="dl-$(date +%Y%m%d-%H%M%S)"
+          SPLIT_DONE="${{ steps.split.outputs.split_done }}"
+          TAG="video-$(date +'%Y%m%d-%H%M%S')"
 
           gh release create "$TAG" \
-            --title "📥 ${FILENAME}" \
-            --notes "Source: ${{ github.event.inputs.url }}" \
-            --latest
+            --title "Video Download - $(date +'%Y-%m-%d %H:%M:%S')" \
+            --notes "Downloaded from: ${{ github.event.inputs.url }}"
 
-          find "$FOLDER" -type f | while read -r f; do
-            gh release upload "$TAG" "$f" --clobber
-          done
+          if [ "$SPLIT_DONE" = "true" ]; then
+            ARCHIVE_NAME="${{ steps.split.outputs.archive_name }}"
+            for f in "$FOLDER/${ARCHIVE_NAME}"*.rar; do
+              gh release upload "$TAG" "$f"
+            done
+          elseFILEPATH="${{ steps.download.outputs.filepath }}"
+            gh release upload "$TAG" "$FILEPATH"
+          fi
