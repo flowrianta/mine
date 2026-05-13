@@ -1,0 +1,193 @@
+name: دانلود فایل نصبی گوگل پلی
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Package name (e.g., com.google.android.youtube)'
+        required: true
+        type: string
+      architecture:
+        description: 'Target architecture'
+        required: true
+        type: choice
+        default: 'arm64'
+        options:
+          - arm64
+          - armv7
+      merge_splits:
+        description: 'Merge split APKs into single installable APK'
+        required: false
+        type: boolean
+        default: true
+      output_folder:
+        description: 'Output folder (relative to repo root)'
+        required: false
+        type: string
+        default: 'downloads'
+
+permissions:
+  contents: write
+
+jobs:
+  download-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openjdk-17-jre-headless p7zip-full python3 python3-pip curl git
+          pip3 install -q gplaydl 2>/dev/null || true
+
+      - name: Setup gplay-apk-downloader
+        run: |
+          git clone --depth=1 https://github.com/alltechdev/gplay-apk-downloader.git
+          cd gplay-apk-downloader
+          # نصب non-interactive
+          pip3 install -q -r requirements.txt 2>/dev/null || true
+          [ -f setup.sh ] && bash setup.sh < /dev/null || true
+
+      - name: Authenticate with Google Play
+        env:
+          GOOGLE_EMAIL: ${{ secrets.GOOGLE_EMAIL }}
+          GOOGLE_PASSWORD: ${{ secrets.GOOGLE_PASSWORD }}
+        run: |
+          if [ -z "$GOOGLE_EMAIL" ] || [ -z "$GOOGLE_PASSWORD" ]; then
+            echo "::error::secrets GOOGLE_EMAIL و GOOGLE_PASSWORD تنظیم نشده‌اند."
+            echo "::error::در Settings > Secrets > Actions این دو secret را اضافه کنید."
+            exit 1
+          fi
+
+          cd gplay-apk-downloader
+
+          # تلاش برای auth با credentials
+          # اگه ابزار interactive بود، credentials رو از stdin بده
+          printf '%s\n%s\ny\n' "$GOOGLE_EMAIL" "$GOOGLE_PASSWORD" | ./gplay auth 2>&1 || {
+            echo "::warning::auth با stdin ناموفق بود، تلاش با env vars..."GPLAY_EMAIL="$GOOGLE_EMAIL" GPLAY_PASSWORD="$GOOGLE_PASSWORD" ./gplay auth --non-interactive 2>&1 || true
+          }
+
+          echo "✅ Auth انجام شد."
+
+      - name: Download APK
+        id: download
+        env:
+          PACKAGE: ${{ inputs.package_name }}
+          ARCH: ${{ inputs.architecture }}
+          MERGE: ${{ inputs.merge_splits }}
+          OUT: ${{ inputs.output_folder }}
+        run: |
+          mkdir -p "$OUT"
+
+          cd gplay-apk-downloader
+
+          CMD="./gplay download $PACKAGE -a $ARCH -o ../$OUT"
+          [ "$MERGE" = "true" ] && CMD="$CMD -m"
+
+          echo "▶ $CMD"
+          $CMD
+
+          # جمع‌آوری همه فایل‌های دانلود شده
+          cd "../$OUT"
+          shopt -s nullglob
+          FILES=(*.apk *.zip *.apks)
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::error::هیچ فایلی دانلود نشد."
+            exit 1
+          fi
+
+          echo "📦 فایل‌های دانلود شده: ${FILES[*]}"
+
+          # ذخیره لیست فایل‌ها برای مراحل بعد (جدا با newline)
+          printf '%s\n' "${FILES[@]}" > /tmp/downloaded_files.txt
+          echo "count=${#FILES[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archive
+        env:
+          PACKAGE: ${{ inputs.package_name }}
+          ARCH: ${{ inputs.architecture }}
+          MERGE: ${{ inputs.merge_splits }}
+          OUT: ${{ inputs.output_folder }}
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+          if [ "$MERGE" = "true" ]; then
+            ARCHIVE_BASE="${PACKAGE}_${ARCH}_merged_${TIMESTAMP}"
+          else
+            ARCHIVE_BASE="${PACKAGE}_${ARCH}_splits_${TIMESTAMP}"
+          fi
+
+          cd "$OUT"
+
+          # آرشیو همه فایل‌های دانلود شده
+          mapfile -t FILES < /tmp/downloaded_files.txt
+
+          echo "✂️ ایجاد آرشیو ${ARCHIVE_BASE}.7z از ${#FILES[@]} فایل"
+          7z a -mx=3 -v85m "${ARCHIVE_BASE}.7z" "${FILES[@]}"
+
+          # اگه فقط یه پارت ساخته شد، پسوند .001 رو حذف کن
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+
+          # حذف فایل‌های اصلی — فقط آرشیو بمونه
+          for f in "${FILES[@]}"; do
+            rm -f "$f"
+          done
+          rm -rf *_contents/
+
+          echo "✅ آرشیو ساخته شد:"
+          ls -lh "${ARCHIVE_BASE}".7z*
+
+      - name: Verify file sizes
+        env:
+          OUT: ${{ inputs.output_folder }}
+        run: |
+          OVERSIZED=false
+          while IFS= read -r -d '' f; do
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt 104857600 ]; then
+              echo "::error::$(basename "$f") حجمش $(( size/1048576 ))MB است — بیشتر از حد 100MB گیت‌هاب"
+              OVERSIZED=truefi
+          done < <(find "$OUT" -type f -print0)
+
+          if [ "$OVERSIZED" = true ]; then
+            echo "::error::chunk size را کاهش دهید (الان 85MB است)."
+            exit 1
+          fi
+
+      - name: Commit and push
+        env:
+          PACKAGE: ${{ inputs.package_name }}
+          ARCH: ${{ inputs.architecture }}
+          OUT: ${{ inputs.output_folder }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$OUT/"
+
+          if git diff --cached --quiet; then
+            echo "✅ چیزی برای commit نیست."
+            exit 0
+          fi
+
+          git commit -m "Download ${PACKAGE} (${ARCH}) from Google Play [skip ci]"
+
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin "${{ github.ref_name }}" 2>/dev/null || trueif git push origin "${{ github.ref_name }}"; then
+              echo "✅ Push موفق (تلاش $i)"
+              exit 0
+            fiecho "⚠️ تلاش $i ناموفق — $(( i * 5 ))s صبر"
+            sleep $(( i * 5 ))
+          done
+
+          echo "::error::Push پس از 5 تلاش شکست خورد"
+          exit 1
