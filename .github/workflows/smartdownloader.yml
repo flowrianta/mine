@@ -1,103 +1,58 @@
-name: smart-downloader
+name: Download Video
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Video page URL or temporary direct link"
+        description: "Video page URL"
         required: true
-        type: string
-
-      output_folder:
-        description: "Output folder"
-        required: false
-        default: "downloads"
-        type: string
-
-permissions:
-  contents: write
 
 jobs:
   download:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
+    - name: Checkout repo
+      uses: actions/checkout@v4
 
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl rar
-          pip install -U yt-dlp
+    - name: Install yt-dlp + ffmpeg
+      run: |
+        sudo apt update
+        sudo apt install -y ffmpeg
+        pip install yt-dlp
 
-      - name: Download file
-        id: download
-        run: |
-          URL="${{ github.event.inputs.url }}"
-          FOLDER="${{ github.event.inputs.output_folder }}"
+    - name: Create folder
+      run: mkdir -p video
 
-          mkdir -p "$FOLDER"
+    - name: Download video
+      run: |
+        URL="${{ github.event.inputs.url }}"
 
-          echo "Checking URL type..."
+        yt-dlp \
+          --retries 10 \
+          --fragment-retries 10 \
+          --merge-output-format mp4 \
+          -o "video/%(title)s.%(ext)s" \
+          "$URL"
 
-          if [[ "$URL" =~ \.(mp4|mkv|webm|mov|avi)(\?|$) ]]; then
-            echo "Direct video link detected"
+    - name: Split if bigger than 95MB
+      run: |
+        cd video
+        FILE=$(ls | head -n 1)
 
-            NAME=$(basename "$URL" | cut -d'?' -f1)
+        SIZE=$(stat -c%s "$FILE")
 
-            curl -L \
-              --retry 5 \
-              --retry-delay 5 \
-              -o "$FOLDER/$NAME" \
-              "$URL"
+        if [ "$SIZE" -gt 95000000 ]; then
+          echo "File too big, splitting..."
+          split -b 90M "$FILE" "$FILE.part."
+          rm "$FILE"
+        fi
 
-            FILE="$FOLDER/$NAME"
+    - name: Commit files
+      run: |
+        git config --global user.name "github-actions"
+        git config --global user.email "actions@github.com"
 
-          else
-            echo "Page URL detected — extracting video"
-
-            yt-dlp \
-              --output "$FOLDER/%(title)s-%(id)s.%(ext)s" \
-              --merge-output-format mp4 \
-              --retries 10 \
-              --fragment-retries 10 \
-              "$URL"
-
-            FILE=$(find "$FOLDER" -type f -name "*.mp4" -o -name "*.mkv" | head -n1)
-          fi
-
-          echo "file=$FILE" >> $GITHUB_OUTPUT
-
-      - name: Split if bigger than 99MB
-        run: |
-          FILE="${{ steps.download.outputs.file }}"
-          FOLDER=$(dirname "$FILE")
-
-          SIZE=$(stat -c %s "$FILE")
-          LIMIT=$((99*1024*1024))
-
-          cd "$FOLDER"
-
-          if [ "$SIZE" -gt "$LIMIT" ]; then
-            NAME=$(basename "$FILE")
-            ARCHIVE="video_$(openssl rand -hex 3)"
-
-            rar a -v95m "$ARCHIVE.rar" "$NAME"
-            rm "$NAME"
-          fi
-
-      - name: Commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add .
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit"
-            exit 0
-          fi
-
-          git commit -m "Add downloaded file"
-          git pull --rebase origin main || true
-          git push
+        git add video/*
+        git commit -m "Add downloaded video" || echo "Nothing to commit"
+        git push
