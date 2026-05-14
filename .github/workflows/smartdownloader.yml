@@ -1,4 +1,4 @@
-name: Download Video
+name: Download Video With Cookies
 
 on:
   workflow_dispatch:
@@ -12,47 +12,54 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repo
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Install yt-dlp + ffmpeg
+    - name: Install tools
       run: |
         sudo apt update
         sudo apt install -y ffmpeg
         pip install yt-dlp
 
-    - name: Create folder
+    - name: Restore cookies.txt
+      run: |
+        echo "${{ secrets.COOKIES }}" > cookies.txt
+
+    - name: Create video folder
       run: mkdir -p video
 
-    - name: Download video
+    - name: Download with yt-dlp + cookies
       run: |
         URL="${{ github.event.inputs.url }}"
 
         yt-dlp \
+          --cookies cookies.txt \
+          --user-agent "Mozilla/5.0" \
+          --referer "$URL" \
           --retries 10 \
           --fragment-retries 10 \
           --merge-output-format mp4 \
           -o "video/%(title)s.%(ext)s" \
           "$URL"
 
-    - name: Split if bigger than 95MB
+    - name: Split large files
       run: |
         cd video
-        FILE=$(ls | head -n 1)
 
+        FILE=$(ls | head -n 1)
         SIZE=$(stat -c%s "$FILE")
 
         if [ "$SIZE" -gt 95000000 ]; then
-          echo "File too big, splitting..."
           split -b 90M "$FILE" "$FILE.part."
           rm "$FILE"
         fi
 
-    - name: Commit files
+    - name: Commit and push
       run: |
         git config --global user.name "github-actions"
         git config --global user.email "actions@github.com"
 
         git add video/*
         git commit -m "Add downloaded video" || echo "Nothing to commit"
+
         git push
