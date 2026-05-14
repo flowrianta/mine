@@ -1,0 +1,103 @@
+name: smart-downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Video page URL or temporary direct link"
+        required: true
+        type: string
+
+      output_folder:
+        description: "Output folder"
+        required: false
+        default: "downloads"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl rar
+          pip install -U yt-dlp
+
+      - name: Download file
+        id: download
+        run: |
+          URL="${{ github.event.inputs.url }}"
+          FOLDER="${{ github.event.inputs.output_folder }}"
+
+          mkdir -p "$FOLDER"
+
+          echo "Checking URL type..."
+
+          if [[ "$URL" =~ \.(mp4|mkv|webm|mov|avi)(\?|$) ]]; then
+            echo "Direct video link detected"
+
+            NAME=$(basename "$URL" | cut -d'?' -f1)
+
+            curl -L \
+              --retry 5 \
+              --retry-delay 5 \
+              -o "$FOLDER/$NAME" \
+              "$URL"
+
+            FILE="$FOLDER/$NAME"
+
+          else
+            echo "Page URL detected — extracting video"
+
+            yt-dlp \
+              --output "$FOLDER/%(title)s-%(id)s.%(ext)s" \
+              --merge-output-format mp4 \
+              --retries 10 \
+              --fragment-retries 10 \
+              "$URL"
+
+            FILE=$(find "$FOLDER" -type f -name "*.mp4" -o -name "*.mkv" | head -n1)
+          fi
+
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+
+      - name: Split if bigger than 99MB
+        run: |
+          FILE="${{ steps.download.outputs.file }}"
+          FOLDER=$(dirname "$FILE")
+
+          SIZE=$(stat -c %s "$FILE")
+          LIMIT=$((99*1024*1024))
+
+          cd "$FOLDER"
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+            NAME=$(basename "$FILE")
+            ARCHIVE="video_$(openssl rand -hex 3)"
+
+            rar a -v95m "$ARCHIVE.rar" "$NAME"
+            rm "$NAME"
+          fi
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Add downloaded file"
+          git pull --rebase origin main || true
+          git push
